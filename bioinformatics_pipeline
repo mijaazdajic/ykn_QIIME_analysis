@@ -1,0 +1,291 @@
+#zip the fastq file
+gzip 011217AP341F-full.fastq
+
+#make the directories and move the files in the right part
+mkdir my_seqs/
+mkdir single_end/
+mv metadata.tsv single_end/
+mv *.fastq.gz my_seqs/
+
+# 1_Importing Single End sequences
+qiime tools import \
+  --type MultiplexedSingleEndBarcodeInSequence \
+  --input-path my_seqs/011217AP341F-full.fastq.gz\
+  --output-path single_end/1_input_seqs.qza
+
+# 2_Demultiplex sequences from the fastq file (separate the sequences based on the sample)
+qiime cutadapt demux-single \
+  --i-seqs single_end/1_input_seqs.qza \
+  --m-barcodes-file single_end/metadata.tsv \
+  --m-barcodes-column BarcodeSequence \
+  --p-error-rate 0 \
+  --o-per-sample-sequences 2_demultiplexed-seqs.qza \
+  --o-untrimmed-sequences 2_untrimmed.qza \
+  --verbose
+
+
+https://nephele.niaid.nih.gov/details_qc/
+#3a_Trim adapters, in this case the forward primer (341F)
+#should be done in a .sh file, takes too long otherwise.sh
+qiime cutadapt trim-single \
+  --i-demultiplexed-sequences 2_demultiplexed-seqs.qza \
+  --p-front CCTACGGGNGGCWGCAG \
+--p-adapter GACTACHVGGGTATCTAATCC  \
+--p-error-rate 0 \
+  --o-trimmed-sequences 3_trimmed-seqs.qza \
+  --verbose
+
+#3b_summarize demultiplexed and trimmed primers
+qiime demux summarize \
+  --i-data 3_trimmed-seqs.qza \
+  --o-visualization 3_trimmed-seqs.qzv
+
+
+#Now that I have used the fastq file from MRDNA I do get many more sequences than previously!! Awesome!
+
+
+
+#4a_denoise with DADA2 (take off chimeras, make ASVs, and quality control)
+#change trunc-length for 298
+qiime dada2 denoise-single --i-demultiplexed-seqs 3_trimmed-seqs.qza \
+                           --p-trim-left 0 \
+                           --p-trunc-len 440 \
+                           --p-max-ee 3 \
+                           --p-n-threads 4 \
+                           --output-dir 4_dada2_output
+
+#4b_look at the denoising stats in qiime2 visulatisation
+qiime metadata tabulate \
+  	--m-input-file 4_dada2_output/denoising_stats.qza\
+  	--o-visualization 4_stats-dada2.qzv
+
+
+#4c_change the name of file for further analyses
+mv 4_dada2_output/representative_sequences.qza 4_dada2_output/rep-seqs.qza
+
+#5_make a feature table and a summary of representative sequences
+
+qiime feature-table summarize \
+  --i-table 4_dada2_output/table.qza \
+  --o-visualization 5_table.qzv \
+  --m-sample-metadata-file single_end/metadata.tsv
+
+qiime feature-table tabulate-seqs \
+  --i-data 4_dada2_output/rep-seqs.qza \
+  --o-visualization 5_rep-seqs.qzv
+
+
+#6_generate phylogenetic tree
+qiime phylogeny align-to-tree-mafft-fasttree \
+  --i-sequences 4_dada2_output/rep-seqs.qza \
+  --o-alignment 6_aligned-rep-seqs.qza \
+  --o-masked-alignment 6_masked-aligned-rep-seqs.qza \
+  --o-tree 6_unrooted-tree.qza \
+  --o-rooted-tree 6_rooted-tree.qza
+
+#7_diversity metrics
+qiime diversity core-metrics-phylogenetic \
+  --i-phylogeny 6_rooted-tree.qza \
+  --i-table 4_dada2_output/table.qza \
+  --p-sampling-depth 1000 \
+  --m-metadata-file single_end/metadata.tsv \
+  --output-dir core-metrics-results
+
+#8_Assign Taxonomy with SILVA database
+#download the classifier in format .qza
+#wget https://data.qiime2.org/2017.4/common/silva-119-99-nb-classifier.qza
+#this one is a trained classifier
+
+#make a new directory
+mkdir training-feature-classifiers
+cd training-feature-classifiers
+
+unzip Silva_132_release.zip
+
+cp SILVA_132_QIIME_release/rep_set/rep_set_16S_only/99/silva_132_99_16S.fna silva_132_99_16s.fna
+
+cp SILVA_132_QIIME_release/taxonomy/16S_only/99/taxonomy_7_levels.txt taxonomy_7_levels.txt
+
+#8_ prep training 16S classifiers (SILVA_132_99) 
+qiime tools import \
+--type 'FeatureData[Sequence]' \
+--input-path silva_132_99_16s.fna \
+--output-path 99_otus.qza 
+
+qiime tools import \
+--type 'FeatureData[Sequence]' \
+--input-path repset_138.qza \
+--output-path 99_otus.qza 
+
+
+#import taxonomy
+qiime tools import \
+--type 'FeatureData[Taxonomy]' \
+--input-format HeaderlessTSVTaxonomyFormat \
+--input-path taxonomy_7_levels.txt \
+--output-path 99_taxonomy.qza
+
+# extracting and training the SILVA 16SV3-V4 classifier 
+qiime feature-classifier extract-reads \
+--i-sequences 99_otus.qza \
+--p-f-primer CCTACGGGNGGCWGCAG \
+--p-r-primer GACTACHVGGGTATCTAATCC \
+--p-trunc-len 466 \
+--o-reads ref-seqs-v34.qza
+
+
+#9_train the classifier, this is in a shell file
+qiime feature-classifier fit-classifier-naive-bayes \
+--i-reference-reads training-feature-classifiers/ref-seqs-v34.qza \
+--i-reference-taxonomy training-feature-classifiers/99_taxonomy.qza \
+--o-classifier training-feature-classifiers/silva132_v34_classifier.qza
+
+#10_test the classifier (done in shell file)
+qiime feature-classifier classify-sklearn \
+  --i-classifier training-feature-classifiers/silva132_v34_classifier.qza \
+  --i-reads 4_dada2_output/rep-seqs.qza \
+  --o-classification taxonomy.qza
+
+qiime metadata tabulate \
+  --m-input-file taxonomy.qza \
+  --o-visualization taxonomy.qzv
+
+#11_Assign taxonomy to my dataset, need to be done as job
+qiime feature-classifier classify-sklearn\
+	--i-reads 4_dada2_output/rep-seqs.qza \
+	--i-classifier training-feature-classifiers/silva132_v34_classifier.qza \
+	--p-n-jobs 4 \
+	--output-dir 11_taxa  
+
+qiime tools export \
+   --input-path 11_taxa/classification.qza 
+--output-path 11_taxa
+
+
+#12_filter out rare ASVs
+#**One possible choice would be to remove all ASVs that have a frequency of less than 0.1% of the mean sample depth. 
+#This cut-off excludes ASVs that are likely due to MiSeq bleed-through between runs (reported by Illumina to be 0.1% of reads). 
+#To calculate this cut-off you would identify the mean sample depth in the visualization created in step 2.4, multiply it by 0.001, 
+#and round to the nearest integer.)
+
+qiime feature-table filter-features \
+   --i-table 4_dada2_output/table.qza \
+   --p-min-frequency 94 \
+   --p-min-samples 1 \
+   --o-filtered-table 4_dada2_output/12_dada2_table_filt.qza
+
+13_filter out contaminanted and unclassified ASVs
+qiime taxa filter-table \
+   --i-table 4_dada2_output/12_dada2_table_filt.qza \
+   --i-taxonomy 11_taxa/classification.qza \
+   --p-exclude mitochondria,chloroplast \
+   --o-filtered-table 4_dada2_output/13_dada2_table_filt_contam.qza
+
+14_Omit low-depth samples
+qiime feature-table summarize \
+   --i-table 4_dada2_output/13_dada2_table_filt_contam.qza \
+   --o-visualization 4_dada2_output/14_dada2_table_filt_contam_summary.qzv
+
+qiime diversity alpha-rarefaction \
+   --i-table 4_dada2_output/13_dada2_table_filt_contam.qza \
+   --p-max-depth 6000 \
+   --p-steps 20 \
+   --p-metrics 'observed_otus' \
+   --o-visualization 14_rarefaction_curves_test.qzv
+
+
+qiime feature-table filter-samples \
+   --i-table 4_dada2_output/13_dada2_table_filt_contam.qza \
+   --p-min-frequency 6000\
+   --o-filtered-table 4_dada2_output/14_dada2_table_final.qza
+
+15_subset and summarise filtered table
+qiime feature-table filter-seqs \
+   --i-data 4_dada2_output/rep-seqs.qza \
+   --i-table 4_dada2_output/14_dada2_table_final.qza \
+   --o-filtered-data 4_dada2_output/15_rep_seqs_final.qza
+
+qiime feature-table summarize \
+   --i-table 4_dada2_output/14_dada2_table_final.qza \
+   --o-visualization 4_dada2_output/15_dada2_table_final_summary.qzv
+
+
+16_build tree with SEPP
+qiime fragment-insertion sepp \
+   --i-representative-sequences 4_dada2_output/15_rep_seqs_final.qza \
+   --o-tree 16_asvs-tree.qza \
+   --o-placements 16_insertion-placements.qza \
+   --p-threads 4
+
+
+17_generate rarefaction curves
+qiime diversity alpha-rarefaction \
+   --i-table 4_dada2_output/14_dada2_table_final.qza\
+   --p-max-depth 6000 \
+   --p-steps 20 \
+   --i-phylogeny 16_asvs-tree.qza \
+   --m-metadata-file single_end/metadata.tsv \
+   --o-visualization 17_rarefaction_curves.qzv
+
+qiime diversity alpha-rarefaction \
+   --i-table 4_dada2_output/14_dada2_table_final.qza\
+   --p-max-depth 6000 \
+   --p-steps 20 \
+   --i-phylogeny 16_asvs-tree.qza \
+   --o-visualization 17_rarefaction_curves.qzv
+
+17_ Generate stacked barchart of taxa relative abundances
+qiime taxa barplot \
+   --i-table 4_dada2_output/14_dada2_table_final.qza \
+   --i-taxonomy 11_taxa/classification.qza \
+   --m-metadata-file single_end/metadata.tsv \
+   --o-visualization 11_taxa/taxa_barplot.qzv
+
+18_ Calculating diversity metrics and generating ordination plots
+qiime diversity core-metrics-phylogenetic \
+   --i-table 4_dada2_output/14_dada2_table_final.qza \
+   --i-phylogeny 16_asvs-tree.qza \
+   --p-sampling-depth 6000 \
+   --m-metadata-file single_end/metadata.tsv \
+   --p-n-jobs 4 \
+   --output-dir 18_diversity
+
+make boxplots #only works if metadata has groups
+qiime diversity alpha-group-significance \
+   --i-alpha-diversity 18_diversity/shannon_vector.qza \
+   --m-metadata-file single_end/metadata.tsv \
+   --o-visualization 18_diversity/shannon_compare_groups.qzv
+
+
+19_ Identifying differentially abundant features with ANCOM
+qiime composition add-pseudocount \
+   --i-table 4_dada2_output/14_dada2_table_final.qza \
+   --p-pseudocount 1 \
+   --o-composition-table 4_dada2_output/19_deblur_table_final_pseudocount.qza
+
+20_ Exporting the final abundance, profile and sequence files
+#Export to FASTA
+qiime tools export \
+   --input-path 4_dada2_output/13_dada2_table_filt_contam.qza \
+   --output-path 20_dada2_output_exported
+
+#Export BIOM
+sed -i -e '1 s/Feature/#Feature/' -e '1 s/Taxon/taxonomy/' 11_taxa/taxonomy.tsv
+
+qiime tools export \
+   --input-path 4_dada2_output/13_dada2_table_filt_contam.qza \
+   --output-path 20_dada2_output_exported
+
+biom add-metadata \
+   -i 20_dada2_output_exported/feature-table.biom \
+   -o 20_dada2_output_exported/feature-table_w_tax.biom \
+   --observation-metadata-fp 11_taxa/taxonomy.tsv \
+   --sc-separated taxonomy
+
+biom convert \
+   -i 20_dada2_output_exported/feature-table_w_tax.biom \
+   -o 20_dada2_output_exported/feature-table_w_tax.txt \
+   --to-tsv \
+   --header-key taxonomy
+
+############################### END ###############################################
